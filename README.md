@@ -1,42 +1,44 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/SAM3-Auto%20Labeler-blueviolet?style=for-the-badge&logo=meta" alt="SAM3 Auto Labeler"/>
+  <img src="https://img.shields.io/badge/LabelForge-AI-blueviolet?style=for-the-badge&logo=github" alt="LabelForge AI"/>
 </p>
 
-<h1 align="center">🎯 SAM3 Auto-Labeler & YOLO Dataset Generator</h1>
+<h1 align="center">LabelForge AI</h1>
 
 <p align="center">
-  <strong>Transform your unlabeled images into production-ready YOLO datasets in minutes, not hours.</strong>
+  <strong>Forge YOLO-ready datasets from Label Studio, SAM3 auto-labeling, and Cosmos synthetic data.</strong>
 </p>
 
 <p align="center">
   <a href="#-quick-start">Quick Start</a> •
   <a href="#-features">Features</a> •
   <a href="#-yolo-dataset-tool">YOLO Tool</a> •
+  <a href="#-cosmos-dataset-balancing">Cosmos Balancing</a> •
   <a href="#-api-reference">API</a> •
   <a href="#-contributing">Contributing</a>
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/python-3.10+-blue.svg?style=flat-square&logo=python" alt="Python 3.10+"/>
-  <img src="https://img.shields.io/badge/PyTorch-2.7.0-ee4c2c.svg?style=flat-square&logo=pytorch" alt="PyTorch"/>
+  <img src="https://img.shields.io/badge/python-3.12-blue.svg?style=flat-square&logo=python" alt="Python 3.12"/>
+  <img src="https://img.shields.io/badge/PyTorch-2.8.0-ee4c2c.svg?style=flat-square&logo=pytorch" alt="PyTorch"/>
   <img src="https://img.shields.io/badge/FastAPI-0.100+-009688.svg?style=flat-square&logo=fastapi" alt="FastAPI"/>
-  <img src="https://img.shields.io/badge/CUDA-12.6-76B900.svg?style=flat-square&logo=nvidia" alt="CUDA"/>
-  <img src="https://img.shields.io/github/license/ranjanjyoti152/Auto-labler-sam3?style=flat-square" alt="License"/>
-  <img src="https://img.shields.io/github/stars/ranjanjyoti152/Auto-labler-sam3?style=flat-square" alt="Stars"/>
+  <img src="https://img.shields.io/badge/CUDA-12.9-76B900.svg?style=flat-square&logo=nvidia" alt="CUDA"/>
+  <img src="https://img.shields.io/github/license/ranjanjyoti152/LabelForge-AI?style=flat-square" alt="License"/>
+  <img src="https://img.shields.io/github/stars/ranjanjyoti152/LabelForge-AI?style=flat-square" alt="Stars"/>
 </p>
 
 ---
 
 ## 🌟 Why This Project?
 
-Manual labeling is **slow**, **expensive**, and **error-prone**. This project leverages Meta's **SAM3 (Segment Anything Model 3)** to automatically detect and label objects in your images with incredible accuracy.
+Manual labeling is **slow**, **expensive**, and **hard to balance across classes**. LabelForge AI combines **Label Studio**, **SAM3**, **YOLO export**, and optional **NVIDIA Cosmos Predict2.5** generation so weak classes can get extra train-only samples without replacing your real data.
 
-| Traditional Labeling | SAM3 Auto-Labeler |
-|---------------------|-------------------|
+| Traditional Labeling | LabelForge AI |
+|---------------------|---------------|
 | ⏱️ Hours per 100 images | ⚡ Minutes per 1000 images |
 | 💰 $0.05-0.10 per label | 🆓 Free (self-hosted) |
 | 😓 Human fatigue errors | 🎯 Consistent AI accuracy |
 | 📦 Single format output | 🔄 YOLO-ready datasets |
+| ⚖️ Class imbalance | 🧬 Optional Cosmos augmentation |
 
 ---
 
@@ -52,6 +54,7 @@ Manual labeling is **slow**, **expensive**, and **error-prone**. This project le
 - **Custom Concepts** - Add your own detection prompts
 - **Real-time RTSP** - Process live video streams
 - **Batch Processing** - 3-5x faster with parallel workers
+- **Class Balancing** - Detect weak classes and generate train-only synthetic samples
 
 </td>
 <td width="50%">
@@ -59,6 +62,8 @@ Manual labeling is **slow**, **expensive**, and **error-prone**. This project le
 ### 🔧 Integrations
 - **Label Studio** - ML backend for human-in-the-loop
 - **YOLO Export** - Ready for YOLOv8/v9/v10 training
+- **LM Studio** - Project-aware Cosmos prompt generation
+- **Cosmos Predict2.5** - Synthetic visual samples for underrepresented classes
 - **REST API** - Easy integration with any system
 - **MJPEG Stream** - Live preview with annotations
 - **Health Probes** - Kubernetes-ready deployment
@@ -74,20 +79,20 @@ Manual labeling is **slow**, **expensive**, and **error-prone**. This project le
 ### Prerequisites
 
 ```bash
-# Python 3.10+ required
+# Python 3.12 recommended
 python --version
 
 # Install PyTorch with CUDA (adjust for your CUDA version)
-pip install torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
-  --index-url https://download.pytorch.org/whl/cu126
+pip install torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
+  --index-url https://download.pytorch.org/whl/cu129
 ```
 
 ### Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/ranjanjyoti152/Auto-labler-sam3.git
-cd Auto-labler-sam3
+git clone https://github.com/ranjanjyoti152/LabelForge-AI.git
+cd LabelForge-AI
 
 # Create virtual environment
 python -m venv .venv
@@ -119,14 +124,14 @@ For easy deployment with GPU support, use Docker:
 ### Prerequisites
 
 - **Docker** 20.10+ with [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
-- **NVIDIA GPU** with CUDA 12.6 compatible drivers
+- **NVIDIA GPU** with CUDA 12.9 compatible drivers
 
 ### Quick Start with Docker Compose
 
 ```bash
 # Clone and configure
-git clone https://github.com/ranjanjyoti152/Auto-labler-sam3.git
-cd Auto-labler-sam3
+git clone https://github.com/ranjanjyoti152/LabelForge-AI.git
+cd LabelForge-AI
 cp .env.example .env
 # Edit .env with your HuggingFace token and settings
 
@@ -139,6 +144,35 @@ docker compose logs -f
 # Stop the service
 docker compose down
 ```
+
+### Cosmos Dataset Balancing
+
+Cosmos Predict2.5 can be used as a batch generator for classes that do not have enough Label Studio examples. SAM3 still creates the labels; Cosmos only generates extra visual samples. For project-specific class prompts, run LM Studio's local OpenAI-compatible server and set `LM_STUDIO_MODEL`.
+
+```bash
+# Clone NVIDIA Cosmos Predict2.5 next to this repo
+cd ..
+git clone https://github.com/nvidia-cosmos/cosmos-predict2.5.git
+cd cosmos-predict2.5
+git lfs pull
+
+# Build and start SAM3 plus the Cosmos container from this repo
+cd ../LabelForge-AI
+export HF_TOKEN=your_huggingface_read_token
+docker compose up -d --build
+
+# Fully automatic balance loop: class counts -> LM Studio prompts -> Cosmos -> SAM3 labels
+python tools/prepare_yolo_dataset.py \
+  -p 1 \
+  --use-existing \
+  --auto-label \
+  -o ./datasets/my_project \
+  --balance-classes \
+  --cosmos-augment \
+  --force
+```
+
+See `docs/cosmos_predict25_dataset_plan.md` for the full balancing plan and quality rules.
 
 ### Build from Source
 
@@ -206,6 +240,13 @@ python tools/prepare_yolo_dataset.py \
   --batch-size 20 \
   --workers 8
 
+# ⚙️ Use CPU-core-based workers
+python tools/prepare_yolo_dataset.py \
+  -p 1 \
+  --auto-label \
+  -o ./datasets/my_project \
+  --max-workers
+
 # 🔍 With preview images for verification
 python tools/prepare_yolo_dataset.py \
   -p 1 \
@@ -219,6 +260,15 @@ python tools/prepare_yolo_dataset.py \
   -p 1 \
   --use-existing \
   -o ./datasets/my_project
+
+# 🧬 Balance weak classes with LM Studio + Cosmos + SAM3
+python tools/prepare_yolo_dataset.py \
+  -p 1 \
+  --use-existing \
+  --auto-label \
+  -o ./datasets/my_project \
+  --balance-classes \
+  --cosmos-augment
 ```
 
 ### CLI Options
@@ -231,6 +281,7 @@ python tools/prepare_yolo_dataset.py \
 | `--use-existing` | Use Label Studio annotations | `false` |
 | `--batch-size` | Tasks per batch | `10` |
 | `--workers` | Parallel download workers | `4` |
+| `--max-workers` | Use all CPU cores for workers and raise batch size | `false` |
 | `--save-preview` | Save preview images | `false` |
 | `--max-tasks` | Limit tasks (0 = all) | `0` |
 | `--train-split` | Train ratio | `0.8` |
@@ -238,6 +289,13 @@ python tools/prepare_yolo_dataset.py \
 | `--test-split` | Test ratio | `0.05` |
 | `--force` | Overwrite existing output | `false` |
 | `--no-batch` | Disable batch mode | `false` |
+| `--balance-classes` | Report classes below the sample target | `false` |
+| `--cosmos-augment` | Generate weak-class samples with LM Studio + Cosmos + SAM3 | `false` |
+| `--min-samples-per-class` | Minimum target boxes per class | `300` |
+| `--synthetic-max-ratio` | Conservative synthetic sample cap | `0.35` |
+| `--lmstudio-url` | LM Studio API base | `http://localhost:1234/v1` |
+| `--lmstudio-model` | LM Studio model for prompt creation | `.env` |
+| `--cosmos-model` | Cosmos Predict2.5 model | `2B/distilled` |
 
 ### Output Structure
 
@@ -252,7 +310,8 @@ datasets/my_project/
 ├── 📁 test/
 │   ├── 📁 images/     # Test images
 │   └── 📁 labels/     # YOLO format labels
-└── 📄 dataset.yaml    # YOLO training config
+├── 📄 quality_report.json # Class balance / synthetic report when enabled
+└── 📄 dataset.yaml        # YOLO training config
 ```
 
 ### Train Your Model
@@ -465,37 +524,41 @@ YOLO_WORKERS=4
 
 ## 🤝 Contributing
 
-We love contributions! Here's how you can help make this project even better:
+Contributions are welcome. LabelForge AI is useful when it stays practical: clear Docker setup, reliable dataset conversion, conservative synthetic augmentation, and docs that help people ship models faster.
 
 ### 🌈 Ways to Contribute
 
 | Type | Description |
 |------|-------------|
-| 🐛 **Bug Reports** | Found a bug? [Open an issue](https://github.com/ranjanjyoti152/Auto-labler-sam3/issues/new) |
-| 💡 **Feature Requests** | Have an idea? Let's discuss it! |
-| 📝 **Documentation** | Help improve our docs |
-| 🔧 **Code** | Submit a pull request |
-| ⭐ **Star** | Star this repo to show support! |
+| 🐛 **Bug Reports** | Found a bug? [Open an issue](https://github.com/ranjanjyoti152/LabelForge-AI/issues/new) with logs and reproduction steps |
+| 💡 **Feature Requests** | Propose improvements for labeling, dataset quality, or deployment |
+| 📝 **Documentation** | Improve setup notes, examples, screenshots, and troubleshooting |
+| 🔧 **Code** | Submit focused pull requests with validation details |
+| 🧪 **Testing** | Try new GPU/CUDA, Label Studio, Cosmos, and YOLO combinations |
+| ⭐ **Star** | Star the repo if it helps your computer vision workflow |
 
 ### 🛠️ Development Setup
 
 ```bash
 # Fork and clone
-git clone https://github.com/YOUR_USERNAME/Auto-labler-sam3.git
-cd Auto-labler-sam3
+git clone https://github.com/YOUR_USERNAME/LabelForge-AI.git
+cd LabelForge-AI
 
 # Create feature branch
 git checkout -b feature/amazing-feature
 
 # Make changes and test
-python -m pytest tests/
+python -m py_compile tools/prepare_yolo_dataset.py tools/cosmos_predict25_batch.py
+docker compose config
 
 # Commit and push
 git commit -m "Add amazing feature"
 git push origin feature/amazing-feature
 
-# Open a Pull Request!
+# Open a pull request
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for branch naming, PR checklist, and dataset safety rules.
 
 ### 📏 Code Style
 
@@ -503,10 +566,11 @@ git push origin feature/amazing-feature
 - Add **docstrings** to functions
 - Write **tests** for new features
 - Update **README** for user-facing changes
+- Keep synthetic data conservative: generated samples belong in `train/`, never `val/` or `test/`
 
 ### 🎯 Good First Issues
 
-Looking for something to work on? Check out our [good first issues](https://github.com/ranjanjyoti152/Auto-labler-sam3/labels/good%20first%20issue)!
+Looking for something to work on? Check out our [good first issues](https://github.com/ranjanjyoti152/LabelForge-AI/labels/good%20first%20issue)!
 
 ---
 
@@ -518,6 +582,9 @@ Looking for something to work on? Check out our [good first issues](https://gith
 - [x] YOLO dataset generation tool
 - [x] Batch processing with parallel workers
 - [x] 🐳 Docker image for easy deployment
+- [x] 🧬 Cosmos Predict2.5 synthetic class balancing
+- [x] 🧠 LM Studio prompt generation for project-specific classes
+- [x] ⚙️ CPU-core-based worker scaling
 - [ ] ☸️ Kubernetes Helm chart
 - [ ] 🖥️ Web UI for dataset management
 - [ ] 🎬 Support for video file input
@@ -563,6 +630,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 ## 🙏 Acknowledgments
 
 - [Meta AI](https://ai.meta.com/) for the incredible SAM3 model
+- [NVIDIA Cosmos](https://github.com/nvidia-cosmos/cosmos-predict2.5) for world generation research
 - [Ultralytics](https://ultralytics.com/) for YOLO
 - [Label Studio](https://labelstud.io/) for the annotation platform
 - All our amazing contributors! 💖
@@ -574,7 +642,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 </p>
 
 <p align="center">
-  <a href="https://github.com/ranjanjyoti152/Auto-labler-sam3/stargazers">
+  <a href="https://github.com/ranjanjyoti152/LabelForge-AI/stargazers">
     <img src="https://img.shields.io/badge/⭐_Star_this_repo-if_it_helped_you!-yellow?style=for-the-badge" alt="Star"/>
   </a>
 </p>

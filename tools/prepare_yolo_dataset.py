@@ -29,6 +29,8 @@ Examples:
 """
 
 import argparse
+import json
+import math
 import os
 import sys
 import shutil
@@ -36,6 +38,8 @@ import random
 import time
 import base64
 import io
+import re
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
@@ -48,17 +52,65 @@ try:
 except ImportError:
     PIL_AVAILABLE = False
 
-# Load .env file automatically
-try:
-    from dotenv import load_dotenv
-    # Try to find .env in current dir or parent dirs
+def _strip_inline_comment(value: str) -> str:
+    """Strip unquoted inline comments from a dotenv value."""
+    quote = None
+    escaped = False
+    for i, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char in ("'", '"'):
+            if quote == char:
+                quote = None
+            elif quote is None:
+                quote = char
+            continue
+        if char == "#" and quote is None and (i == 0 or value[i - 1].isspace()):
+            return value[:i].rstrip()
+    return value.strip()
+
+
+def _load_env_file() -> None:
+    """Load .env values even when python-dotenv is not installed."""
     env_path = Path(__file__).resolve().parent.parent / ".env"
-    if env_path.exists():
-        load_dotenv(env_path)
-    else:
-        load_dotenv()  # Try current directory
-except ImportError:
-    pass  # dotenv not installed, use environment variables directly
+
+    try:
+        from dotenv import load_dotenv
+        if env_path.exists():
+            load_dotenv(env_path)
+        else:
+            load_dotenv()  # Try current directory
+        return
+    except ImportError:
+        pass
+
+    if not env_path.exists():
+        return
+
+    for raw_line in env_path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+
+        value = _strip_inline_comment(value.strip())
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
+# Load .env file automatically before reading defaults below.
+_load_env_file()
 
 import requests
 
@@ -78,6 +130,23 @@ SAM3_CROSS_CLASS_NMS = os.environ.get("SAM3_CROSS_CLASS_NMS", "true").lower() ==
 # Batch processing configuration
 DEFAULT_BATCH_SIZE = int(os.environ.get("YOLO_BATCH_SIZE", "10"))
 DEFAULT_WORKERS = int(os.environ.get("YOLO_WORKERS", "4"))
+
+
+def cpu_worker_count() -> int:
+    """Return a practical worker count from available CPU cores."""
+    return max(1, os.cpu_count() or DEFAULT_WORKERS)
+
+# Dataset balancing / Cosmos Predict2.5 configuration
+DEFAULT_MIN_SAMPLES_PER_CLASS = int(os.environ.get("DATASET_MIN_SAMPLES_PER_CLASS", "300"))
+DEFAULT_COSMOS_SYNTHETIC_MAX_RATIO = float(os.environ.get("COSMOS_SYNTHETIC_MAX_RATIO", "0.35"))
+DEFAULT_COSMOS_MODEL = os.environ.get("COSMOS_MODEL", "2B/distilled")
+DEFAULT_COSMOS_FRAMES_PER_VIDEO = int(os.environ.get("COSMOS_FRAMES_PER_VIDEO", "12"))
+DEFAULT_LM_STUDIO_API_BASE = os.environ.get(
+    "LM_STUDIO_API_BASE",
+    os.environ.get("LMSTUDIO_API_BASE", "http://localhost:1234/v1"),
+)
+DEFAULT_LM_STUDIO_MODEL = os.environ.get("LM_STUDIO_MODEL", os.environ.get("LMSTUDIO_MODEL", ""))
+DEFAULT_LM_STUDIO_API_KEY = os.environ.get("LM_STUDIO_API_KEY", os.environ.get("LMSTUDIO_API_KEY", "lm-studio"))
 
 
 class Colors:
@@ -1123,6 +1192,398 @@ names:
     print(f"{Colors.GREEN}✓ Created dataset.yaml at {yaml_path}{Colors.ENDC}")
 
 
+def validate_output_dir(output_dir: Path, force: bool = False) -> None:
+    """Fail fast when the dataset output path cannot be created or replaced."""
+    if output_dir.exists():
+        if not force:
+            print(f"{Colors.RED}✗ Output directory exists. Use --force to overwrite{Colors.ENDC}")
+            sys.exit(1)
+        if not os.access(output_dir, os.W_OK | os.X_OK):
+            print(f"{Colors.RED}✗ Output directory is not writable: {output_dir}{Colors.ENDC}")
+            print("  Fix ownership/permissions or choose a different --output-dir.")
+            sys.exit(1)
+        return
+
+    parent = output_dir.parent
+    while not parent.exists() and parent != parent.parent:
+        parent = parent.parent
+
+    if not parent.exists() or not os.access(parent, os.W_OK | os.X_OK):
+        print(f"{Colors.RED}✗ Cannot create output directory: {output_dir}{Colors.ENDC}")
+        print(f"  Parent directory is not writable: {parent}")
+        print("  Fix ownership/permissions or choose a different --output-dir.")
+        sys.exit(1)
+
+
+def slugify_name(value: str) -> str:
+    """Create a filesystem-safe slug while keeping class names readable."""
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", value.strip().lower()).strip("_")
+    return slug or "class"
+
+
+def project_path(pattern: str, project_id: int) -> Path:
+    """Resolve a path pattern that may include {project_id}."""
+    path = Path(pattern.format(project_id=project_id))
+    if path.is_absolute():
+        return path
+    return Path(__file__).resolve().parent.parent / path
+
+
+def identify_weak_classes(
+    labels: List[str],
+    class_counts: Dict[str, int],
+    min_samples_per_class: int,
+    synthetic_max_ratio: float,
+    frames_per_video: int,
+) -> List[Dict[str, Any]]:
+    """Find classes that need extra train-only synthetic examples."""
+    weak_classes: List[Dict[str, Any]] = []
+    frames_per_video = max(1, frames_per_video)
+
+    for label in labels:
+        real_count = int(class_counts.get(label, 0))
+        if real_count >= min_samples_per_class:
+            continue
+
+        deficit = min_samples_per_class - real_count
+        synthetic_cap_basis = max(real_count, min_samples_per_class)
+        max_synthetic = max(1, int(synthetic_cap_basis * synthetic_max_ratio))
+        target_synthetic = min(deficit, max_synthetic)
+        video_count = max(1, math.ceil(target_synthetic / frames_per_video))
+
+        weak_classes.append({
+            "class_name": label,
+            "current_count": real_count,
+            "min_samples": min_samples_per_class,
+            "deficit": deficit,
+            "target_synthetic_frames": target_synthetic,
+            "cosmos_video_count": video_count,
+        })
+
+    return weak_classes
+
+
+class LMStudioPromptClient:
+    """OpenAI-compatible LM Studio client for project-specific Cosmos prompts."""
+
+    def __init__(self, base_url: str, api_key: str, model: str, timeout: int):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+
+    def generate_prompts(
+        self,
+        project_title: str,
+        labels: List[str],
+        weak_classes: List[Dict[str, Any]],
+        frames_per_video: int,
+    ) -> List[Dict[str, Any]]:
+        if not self.model:
+            raise ValueError("LM Studio model is not configured.")
+
+        system_prompt = (
+            "You create high-quality NVIDIA Cosmos text2world prompts for object detection dataset balancing. "
+            "Return only valid JSON. Do not include markdown. Prompts must be realistic camera scenes, "
+            "visually diverse, and useful for YOLO object detection. Avoid text overlays, watermarks, logos, "
+            "distorted objects, extreme occlusion, and synthetic-looking studio renders."
+        )
+        user_payload = {
+            "project_title": project_title,
+            "all_project_classes": labels,
+            "weak_classes": weak_classes,
+            "frames_per_video": frames_per_video,
+            "required_output_schema": {
+                "prompts": [{
+                    "class_name": "exact class from weak_classes",
+                    "name": "short filesystem-safe job name",
+                    "inference_type": "text2world",
+                    "prompt": "single detailed prompt",
+                    "negative_prompt": "single negative prompt",
+                    "count": "cosmos_video_count for this class",
+                    "seed": "integer seed",
+                }]
+            },
+            "rules": [
+                "Create exactly one prompt item per weak class.",
+                "Use each weak class name exactly as provided.",
+                "The target object should be clearly visible, realistic, and large enough for detection.",
+                "Mention natural context, camera angle, lighting, background, and object variety.",
+                "Do not create examples for classes that are not in weak_classes.",
+                "Set count equal to cosmos_video_count.",
+            ],
+        }
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload, indent=2)},
+            ],
+            "temperature": 0.4,
+            "response_format": {"type": "json_object"},
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        resp = requests.post(
+            f"{self.base_url}/chat/completions",
+            json=payload,
+            headers=headers,
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        parsed = parse_lmstudio_json(content)
+        prompts = parsed.get("prompts") if isinstance(parsed, dict) else parsed
+        return normalize_cosmos_prompts(prompts, weak_classes)
+
+
+def parse_lmstudio_json(content: str) -> Any:
+    """Parse JSON from LM Studio, tolerating accidental code fences."""
+    text = content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            return json.loads(text[start:end + 1])
+        raise
+
+
+def normalize_cosmos_prompts(prompts: Any, weak_classes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only valid prompt fields and enforce counts/class names."""
+    if not isinstance(prompts, list):
+        raise ValueError("LM Studio response must include a prompts list.")
+
+    weak_by_name = {item["class_name"]: item for item in weak_classes}
+    normalized: List[Dict[str, Any]] = []
+    for item in prompts:
+        if not isinstance(item, dict):
+            continue
+        class_name = item.get("class_name")
+        prompt = item.get("prompt")
+        if class_name not in weak_by_name or not prompt:
+            continue
+
+        weak = weak_by_name[class_name]
+        normalized.append({
+            "class_name": class_name,
+            "name": slugify_name(str(item.get("name") or class_name)),
+            "inference_type": item.get("inference_type", "text2world"),
+            "prompt": str(prompt).strip(),
+            "negative_prompt": str(item.get("negative_prompt") or default_negative_prompt()).strip(),
+            "count": int(weak["cosmos_video_count"]),
+            "seed": int(item.get("seed", 1000 + len(normalized) * 100)),
+        })
+
+    missing = [item["class_name"] for item in weak_classes if item["class_name"] not in {p["class_name"] for p in normalized}]
+    if missing:
+        raise ValueError(f"LM Studio did not return valid prompts for: {', '.join(missing)}")
+    return normalized
+
+
+def default_negative_prompt() -> str:
+    return (
+        "text, watermark, logo, cartoon, blurry, duplicate objects merged together, distorted geometry, "
+        "unrealistic scale, heavy occlusion, tiny target object, overexposed, underexposed"
+    )
+
+
+def fallback_cosmos_prompts(
+    project_title: str,
+    weak_classes: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Deterministic fallback when LM Studio is unavailable."""
+    prompts: List[Dict[str, Any]] = []
+    for index, weak in enumerate(weak_classes):
+        class_name = weak["class_name"]
+        prompts.append({
+            "class_name": class_name,
+            "name": f"{slugify_name(class_name)}_balanced",
+            "inference_type": "text2world",
+            "prompt": (
+                f"Realistic video from the {project_title} dataset context showing one or more clearly visible "
+                f"{class_name} objects in natural surroundings. Use varied camera distance, practical lighting, "
+                f"real-world background clutter, and enough object size for accurate object detection labels."
+            ),
+            "negative_prompt": default_negative_prompt(),
+            "count": int(weak["cosmos_video_count"]),
+            "seed": 1000 + index * 100,
+        })
+    return prompts
+
+
+def write_json_file(path: Path, data: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def run_cosmos_prompt_batch(
+    prompts_path: Path,
+    jobs_dir: Path,
+    cosmos_output_dir: Path,
+    frames_dir: Path,
+    model: str,
+    frames_per_video: int,
+    build: bool,
+) -> None:
+    """Create Cosmos jobs, run Docker generation, and extract frames."""
+    script_path = Path(__file__).resolve().parent / "cosmos_predict25_batch.py"
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--prompts",
+        str(prompts_path),
+        "--jobs-dir",
+        str(jobs_dir),
+        "--output-dir",
+        str(cosmos_output_dir),
+        "--frames-dir",
+        str(frames_dir),
+        "--model",
+        model,
+        "--frames-per-video",
+        str(frames_per_video),
+        "--run",
+        "--extract-frames",
+    ]
+    if build:
+        cmd.append("--build")
+    subprocess.run(cmd, cwd=Path(__file__).resolve().parent.parent, check=True)
+
+
+def load_job_class_map(jobs_dir: Path) -> Dict[str, str]:
+    """Map generated Cosmos job stems to their target class."""
+    job_map: Dict[str, str] = {}
+    if not jobs_dir.exists():
+        return job_map
+    for job_path in sorted(jobs_dir.glob("*.json")):
+        try:
+            with open(job_path, "r") as f:
+                data = json.load(f)
+            if data.get("class_name"):
+                job_map[job_path.stem] = data["class_name"]
+        except Exception:
+            continue
+    return job_map
+
+
+def class_for_frame(frame_path: Path, job_class_map: Dict[str, str]) -> Optional[str]:
+    """Infer target class from an extracted frame filename."""
+    frame_stem = frame_path.stem
+    for job_stem, class_name in sorted(job_class_map.items(), key=lambda item: len(item[0]), reverse=True):
+        if frame_stem == job_stem or frame_stem.startswith(f"{job_stem}_"):
+            return class_name
+    return None
+
+
+def label_synthetic_frames(
+    frames_dir: Path,
+    jobs_dir: Path,
+    output_dir: Path,
+    label_to_id: Dict[str, int],
+    sam3_client: SAM3Client,
+    preview_dir: Optional[Path],
+) -> Dict[str, Any]:
+    """Run SAM3 over Cosmos frames and add accepted labels to train split."""
+    train_images_dir = output_dir / "train" / "images"
+    train_labels_dir = output_dir / "train" / "labels"
+    train_images_dir.mkdir(parents=True, exist_ok=True)
+    train_labels_dir.mkdir(parents=True, exist_ok=True)
+
+    job_class_map = load_job_class_map(jobs_dir)
+    image_files = [
+        path for path in sorted(frames_dir.rglob("*"))
+        if path.suffix.lower() in [".jpg", ".jpeg", ".png", ".bmp", ".webp"]
+    ]
+
+    report: Dict[str, Any] = {
+        "frames_seen": len(image_files),
+        "accepted_images": 0,
+        "rejected_images": 0,
+        "accepted_boxes": 0,
+        "accepted_by_class": {},
+        "rejected_reasons": {},
+    }
+
+    for frame_path in image_files:
+        class_name = class_for_frame(frame_path, job_class_map)
+        if class_name not in label_to_id:
+            report["rejected_images"] += 1
+            report["rejected_reasons"]["unknown_class"] = report["rejected_reasons"].get("unknown_class", 0) + 1
+            continue
+
+        try:
+            image_data = frame_path.read_bytes()
+            image_base64 = base64.b64encode(image_data).decode("utf-8")
+            annotations = sam3_client.predict_with_base64(image_base64, [class_name])
+            annotations = [ann for ann in annotations if ann.get("label") == class_name]
+            yolo_lines = convert_to_yolo_format(annotations, label_to_id)
+        except Exception as e:
+            report["rejected_images"] += 1
+            reason = f"sam3_error:{str(e)[:50]}"
+            report["rejected_reasons"][reason] = report["rejected_reasons"].get(reason, 0) + 1
+            continue
+
+        if not yolo_lines:
+            report["rejected_images"] += 1
+            report["rejected_reasons"]["no_valid_boxes"] = report["rejected_reasons"].get("no_valid_boxes", 0) + 1
+            continue
+
+        class_slug = slugify_name(class_name)
+        dst_stem = f"cosmos_{class_slug}_{report['accepted_images'] + 1:06d}"
+        dst_image = train_images_dir / f"{dst_stem}.jpg"
+        dst_label = train_labels_dir / f"{dst_stem}.txt"
+
+        shutil.copy2(frame_path, dst_image)
+        with open(dst_label, "w") as f:
+            f.write("\n".join(yolo_lines))
+
+        if preview_dir is not None:
+            preview_data = draw_preview_image(image_data, annotations, label_to_id)
+            if preview_data:
+                with open(preview_dir / f"{dst_stem}_preview.jpg", "wb") as f:
+                    f.write(preview_data)
+
+        report["accepted_images"] += 1
+        report["accepted_boxes"] += len(yolo_lines)
+        accepted_by_class = report["accepted_by_class"]
+        accepted_by_class[class_name] = accepted_by_class.get(class_name, 0) + len(yolo_lines)
+
+    return report
+
+
+def write_quality_report(
+    output_dir: Path,
+    project: Dict[str, Any],
+    labels: List[str],
+    real_counts: Dict[str, int],
+    weak_classes: List[Dict[str, Any]],
+    prompts_path: Optional[Path],
+    synthetic_report: Optional[Dict[str, Any]],
+) -> None:
+    """Write a compact machine-readable dataset quality report."""
+    report = {
+        "project_id": project.get("id"),
+        "project_title": project.get("title", "Unknown"),
+        "labels": labels,
+        "real_class_counts": {label: int(real_counts.get(label, 0)) for label in labels},
+        "weak_classes": weak_classes,
+        "cosmos_prompts": str(prompts_path) if prompts_path else None,
+        "synthetic": synthetic_report,
+    }
+    write_json_file(output_dir / "quality_report.json", report)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Prepare YOLO dataset from Label Studio annotations",
@@ -1170,10 +1631,48 @@ Examples:
                         help=f"Number of tasks to process per batch (default: {DEFAULT_BATCH_SIZE})")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"Number of parallel workers for downloads (default: {DEFAULT_WORKERS})")
+    parser.add_argument("--max-workers", action="store_true",
+                        help="Use all available CPU cores for download/processing workers and raise batch size if needed")
     parser.add_argument("--no-batch", action="store_true",
                         help="Disable batch processing (process one-by-one)")
+    parser.add_argument("--balance-classes", action="store_true",
+                        help="Report classes below --min-samples-per-class")
+    parser.add_argument("--cosmos-augment", action="store_true",
+                        help="Use LM Studio + Cosmos Predict2.5 + SAM3 to add train-only samples for weak classes")
+    parser.add_argument("--min-samples-per-class", type=int, default=DEFAULT_MIN_SAMPLES_PER_CLASS,
+                        help=f"Minimum desired boxes per class (default: {DEFAULT_MIN_SAMPLES_PER_CLASS})")
+    parser.add_argument("--synthetic-max-ratio", type=float, default=DEFAULT_COSMOS_SYNTHETIC_MAX_RATIO,
+                        help=f"Maximum synthetic frames as a ratio of class target basis (default: {DEFAULT_COSMOS_SYNTHETIC_MAX_RATIO})")
+    parser.add_argument("--cosmos-model", type=str, default=DEFAULT_COSMOS_MODEL,
+                        help=f"Cosmos model passed to examples/inference.py (default: {DEFAULT_COSMOS_MODEL})")
+    parser.add_argument("--cosmos-build", action="store_true",
+                        help="Build the Cosmos Predict2.5 Docker image before generation")
+    parser.add_argument("--cosmos-frames-per-video", type=int, default=DEFAULT_COSMOS_FRAMES_PER_VIDEO,
+                        help=f"Frames to extract per generated video (default: {DEFAULT_COSMOS_FRAMES_PER_VIDEO})")
+    parser.add_argument("--cosmos-prompts-out", type=str, default="cosmos/prompts/project_{project_id}_prompts.json",
+                        help="Where generated Cosmos prompts are saved; supports {project_id}")
+    parser.add_argument("--cosmos-jobs-dir", type=str, default="cosmos/jobs/project_{project_id}",
+                        help="Where generated Cosmos job JSON files are saved; supports {project_id}")
+    parser.add_argument("--cosmos-output-dir", type=str, default="cosmos/outputs/project_{project_id}",
+                        help="Where Cosmos writes generated videos; supports {project_id}")
+    parser.add_argument("--cosmos-frames-dir", type=str, default="cosmos/frames/project_{project_id}",
+                        help="Where extracted Cosmos frames are saved; supports {project_id}")
+    parser.add_argument("--lmstudio-url", type=str, default=DEFAULT_LM_STUDIO_API_BASE,
+                        help=f"LM Studio OpenAI-compatible API base (default: {DEFAULT_LM_STUDIO_API_BASE})")
+    parser.add_argument("--lmstudio-model", type=str, default=DEFAULT_LM_STUDIO_MODEL,
+                        help="LM Studio model name used to generate Cosmos prompts")
+    parser.add_argument("--lmstudio-api-key", type=str, default=DEFAULT_LM_STUDIO_API_KEY,
+                        help="LM Studio API key if configured")
+    parser.add_argument("--lmstudio-timeout", type=int, default=120,
+                        help="LM Studio request timeout in seconds")
     
     args = parser.parse_args()
+
+    if args.cosmos_augment:
+        args.balance_classes = True
+    if args.max_workers:
+        args.workers = cpu_worker_count()
+        args.batch_size = max(args.batch_size, args.workers * 2)
     
     # Validate arguments
     if not args.use_existing and not args.auto_label:
@@ -1197,11 +1696,13 @@ Examples:
   Output Dir:      {Path(args.output_dir).absolute()}
   Use Existing:    {'Yes' if args.use_existing else 'No'}
   Auto-Label:      {'Yes' if args.auto_label else 'No'}
+  Balance Classes: {'Yes' if args.balance_classes else 'No'}
+  Cosmos Augment:  {'Yes' if args.cosmos_augment else 'No'}
   Split Ratio:     train={args.train_split}, val={args.val_split}, test={args.test_split}
   Batch Mode:      {'Disabled' if args.no_batch else f'Yes (batch_size={args.batch_size}, workers={args.workers})'}
 """)
     
-    if args.auto_label:
+    if args.auto_label or args.cosmos_augment:
         print(f"  {Colors.BOLD}SAM3 Detection Config (from .env):{Colors.ENDC}")
         print(f"    • Score Threshold:  {SAM3_SCORE_THRESHOLD}")
         print(f"    • NMS Threshold:    {SAM3_NMS_THRESHOLD}")
@@ -1209,12 +1710,25 @@ Examples:
         print(f"    • Max Detections:   {SAM3_MAX_DETECTIONS}")
         print(f"    • Cross-Class NMS:  {SAM3_CROSS_CLASS_NMS}")
         print()
+
+    if args.cosmos_augment:
+        print(f"  {Colors.BOLD}Cosmos / LM Studio Config:{Colors.ENDC}")
+        print(f"    • Min Samples/Class: {args.min_samples_per_class}")
+        print(f"    • Synthetic Ratio:   {args.synthetic_max_ratio}")
+        print(f"    • Cosmos Model:      {args.cosmos_model}")
+        print(f"    • Frames/Video:      {args.cosmos_frames_per_video}")
+        print(f"    • LM Studio URL:     {args.lmstudio_url}")
+        print(f"    • LM Studio Model:   {args.lmstudio_model or '(not set; fallback prompts)'}")
+        print()
+
+    output_dir = Path(args.output_dir)
+    validate_output_dir(output_dir, force=args.force)
     
     # Initialize clients
     ls_client = LabelStudioClient(args.ls_url, args.ls_token)
     sam3_client = None
     
-    if args.auto_label:
+    if args.auto_label or args.cosmos_augment:
         sam3_client = SAM3Client(args.sam3_url)
         if not sam3_client.health_check():
             print(f"{Colors.RED}✗ SAM3 server not responding at {args.sam3_url}{Colors.ENDC}")
@@ -1273,7 +1787,6 @@ Examples:
         sys.exit(0)
     
     # Prepare output directory
-    output_dir = Path(args.output_dir)
     if output_dir.exists():
         if args.force:
             shutil.rmtree(output_dir)
@@ -1297,8 +1810,14 @@ Examples:
     # Create temp directories for processing
     temp_images_dir = output_dir / "_temp_images"
     temp_labels_dir = output_dir / "_temp_labels"
-    temp_images_dir.mkdir(parents=True, exist_ok=True)
-    temp_labels_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        temp_images_dir.mkdir(parents=True, exist_ok=True)
+        temp_labels_dir.mkdir(parents=True, exist_ok=True)
+    except PermissionError as e:
+        print(f"{Colors.RED}✗ Cannot create output directory: {output_dir}{Colors.ENDC}")
+        print(f"  {e}")
+        print("  Fix ownership/permissions or choose a different --output-dir.")
+        sys.exit(1)
     
     # Process tasks
     print_section("Processing Tasks" + (" (Batch Mode)" if not args.no_batch else " (Sequential)"))
@@ -1384,6 +1903,30 @@ Examples:
     
     # Print processing summary
     stats.print_summary()
+
+    real_class_counts = dict(stats.class_counts)
+    weak_classes: List[Dict[str, Any]] = []
+    prompts_path: Optional[Path] = None
+    synthetic_report: Optional[Dict[str, Any]] = None
+
+    if args.balance_classes:
+        weak_classes = identify_weak_classes(
+            labels,
+            real_class_counts,
+            args.min_samples_per_class,
+            args.synthetic_max_ratio,
+            args.cosmos_frames_per_video,
+        )
+        print_section("Class Balance")
+        if weak_classes:
+            print(f"{Colors.YELLOW}⚠ {len(weak_classes)} class(es) below {args.min_samples_per_class} boxes:{Colors.ENDC}")
+            for weak in weak_classes:
+                print(
+                    f"    {weak['class_name']}: {weak['current_count']} boxes, "
+                    f"need {weak['deficit']}, planned synthetic frames <= {weak['target_synthetic_frames']}"
+                )
+        else:
+            print(f"{Colors.GREEN}✓ All classes meet the minimum sample target{Colors.ENDC}")
     
     # Split dataset
     print_section("Splitting Dataset")
@@ -1399,6 +1942,86 @@ Examples:
     # Clean up temp directories
     shutil.rmtree(temp_images_dir, ignore_errors=True)
     shutil.rmtree(temp_labels_dir, ignore_errors=True)
+
+    if args.cosmos_augment and weak_classes:
+        print_section("Cosmos Synthetic Augmentation")
+        project_title = project.get("title", f"project_{args.project_id}")
+        prompts_path = project_path(args.cosmos_prompts_out, args.project_id)
+        jobs_dir = project_path(args.cosmos_jobs_dir, args.project_id)
+        cosmos_output_dir = project_path(args.cosmos_output_dir, args.project_id)
+        frames_dir = project_path(args.cosmos_frames_dir, args.project_id)
+
+        try:
+            if args.lmstudio_model:
+                print(f"{Colors.CYAN}ℹ Generating project-specific Cosmos prompts with LM Studio...{Colors.ENDC}")
+                lm_client = LMStudioPromptClient(
+                    args.lmstudio_url,
+                    args.lmstudio_api_key,
+                    args.lmstudio_model,
+                    args.lmstudio_timeout,
+                )
+                cosmos_prompts = lm_client.generate_prompts(
+                    project_title,
+                    labels,
+                    weak_classes,
+                    args.cosmos_frames_per_video,
+                )
+            else:
+                print(f"{Colors.YELLOW}⚠ LM Studio model not set; using deterministic fallback prompts{Colors.ENDC}")
+                cosmos_prompts = fallback_cosmos_prompts(project_title, weak_classes)
+        except Exception as e:
+            print(f"{Colors.YELLOW}⚠ LM Studio prompt generation failed: {e}{Colors.ENDC}")
+            print(f"{Colors.YELLOW}  Falling back to deterministic prompts so the loop can continue.{Colors.ENDC}")
+            cosmos_prompts = fallback_cosmos_prompts(project_title, weak_classes)
+
+        write_json_file(prompts_path, cosmos_prompts)
+        print(f"{Colors.GREEN}✓ Saved Cosmos prompts: {prompts_path}{Colors.ENDC}")
+
+        try:
+            run_cosmos_prompt_batch(
+                prompts_path,
+                jobs_dir,
+                cosmos_output_dir,
+                frames_dir,
+                args.cosmos_model,
+                args.cosmos_frames_per_video,
+                args.cosmos_build,
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"{Colors.RED}✗ Cosmos generation failed with exit code {e.returncode}{Colors.ENDC}")
+            print("  Fix the Cosmos Docker run, then rerun with --cosmos-augment.")
+            write_quality_report(output_dir, project, labels, real_class_counts, weak_classes, prompts_path, None)
+            sys.exit(1)
+
+        print(f"{Colors.CYAN}ℹ Labeling Cosmos frames with SAM3...{Colors.ENDC}")
+        synthetic_report = label_synthetic_frames(
+            frames_dir,
+            jobs_dir,
+            output_dir,
+            label_to_id,
+            sam3_client,
+            preview_dir,
+        )
+        counts["train"] += int(synthetic_report["accepted_images"])
+        print(
+            f"{Colors.GREEN}✓ Accepted {synthetic_report['accepted_images']} synthetic train images "
+            f"with {synthetic_report['accepted_boxes']} boxes{Colors.ENDC}"
+        )
+    elif args.cosmos_augment:
+        print_section("Cosmos Synthetic Augmentation")
+        print(f"{Colors.GREEN}✓ Skipped: no weak classes found{Colors.ENDC}")
+
+    if args.balance_classes or args.cosmos_augment:
+        write_quality_report(
+            output_dir,
+            project,
+            labels,
+            real_class_counts,
+            weak_classes,
+            prompts_path,
+            synthetic_report,
+        )
+        print(f"{Colors.GREEN}✓ Wrote quality report: {output_dir / 'quality_report.json'}{Colors.ENDC}")
     
     # Create dataset.yaml
     create_dataset_yaml(output_dir, labels, project.get("title", "yolo_dataset"))

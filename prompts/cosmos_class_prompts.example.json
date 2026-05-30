@@ -1,0 +1,26 @@
+[
+  {
+    "class_name": "helmet",
+    "name": "helmet_low_light_warehouse",
+    "inference_type": "text2world",
+    "prompt": "A realistic fixed security camera view inside an industrial warehouse. Several workers wearing safety helmets move near shelves and pallets in low indoor lighting. The helmets are clearly visible, physically plausible, and not obstructed. Natural camera perspective, sharp focus, no text overlays.",
+    "negative_prompt": "blurry, low quality, artifacts, distorted helmets, duplicate people, text overlays",
+    "count": 1
+  },
+  {
+    "class_name": "forklift",
+    "name": "forklift_loading_dock",
+    "inference_type": "text2world",
+    "prompt": "A realistic loading dock scene from a wide surveillance camera. A forklift moves slowly between pallets and warehouse doors, with clear visibility of the forklift body and forks. Industrial lighting, natural shadows, physically realistic motion, no text overlays.",
+    "negative_prompt": "blurry, low quality, artifacts, deformed vehicle, text overlays",
+    "count": 1
+  },
+  {
+    "class_name": "traffic cone",
+    "name": "traffic_cones_parking_area",
+    "inference_type": "text2world",
+    "prompt": "A realistic outdoor parking area captured by a static security camera. Multiple orange traffic cones are placed around a temporary work zone. The cones are clearly visible at different distances, with natural daylight and realistic pavement texture.",
+    "negative_prompt": "blurry, low quality, artifacts, distorted cones, text overlays",
+    "count": 1
+  }
+]

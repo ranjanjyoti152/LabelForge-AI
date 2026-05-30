@@ -6,6 +6,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        CUDA_VERSION: "12.9.1"
+        PYTORCH_VERSION: "2.8.0"
+        TORCHVISION_VERSION: "0.23.0"
+        TORCHAUDIO_VERSION: "2.8.0"
+        PYTORCH_CUDA_INDEX: "cu129"
     container_name: sam3-auto-labeler
     
     # GPU Configuration - requires NVIDIA Container Toolkit
@@ -14,7 +20,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: all
               capabilities: [gpu]
     
     ports:
@@ -23,6 +29,9 @@ services:
     # Environment configuration
     env_file:
       - .env
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
     
     # Persist model weights and datasets
     volumes:
@@ -38,6 +47,45 @@ services:
       start_period: 60s
     
     restart: unless-stopped
+
+  # Optional synthetic data generator for weak YOLO classes.
+  #
+  # This service builds NVIDIA Cosmos Predict2.5 from a sibling checkout:
+  #   git clone https://github.com/nvidia-cosmos/cosmos-predict2.5.git ../cosmos-predict2.5
+  #
+  cosmos:
+    depends_on:
+      - sam3-auto-labeler
+    build:
+      context: ${COSMOS_PREDICT25_REPO:-../cosmos-predict2.5}
+      dockerfile: Dockerfile
+      args:
+        CUDA_NAME: ${COSMOS_CUDA_NAME:-cu128}
+    image: ${COSMOS_PREDICT25_IMAGE:-cosmos-predict-2.5}
+    container_name: cosmos-predict25
+    runtime: nvidia
+    ipc: host
+    stdin_open: true
+    tty: true
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_HOME: /root/.cache/huggingface
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${COSMOS_PREDICT25_REPO:-../cosmos-predict2.5}:/workspace
+      - /workspace/.venv
+      - ${COSMOS_CACHE_DIR:-${HOME}/.cache}:/root/.cache
+      - .:/auto-labeler
+    working_dir: /workspace
+    command: ["sleep", "infinity"]
 
 # Optional: Add Label Studio for human-in-the-loop workflows
 #  label-studio:

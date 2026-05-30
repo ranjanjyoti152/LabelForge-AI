@@ -1,7 +1,8 @@
 # SAM3 Auto-Labeler Docker Image
 # GPU-enabled container for automatic object detection and YOLO dataset generation
 
-FROM nvidia/cuda:12.6.2-runtime-ubuntu24.04
+ARG CUDA_VERSION=12.9.1
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
 
 # Prevent interactive prompts during package installation
 ENV DEBIAN_FRONTEND=noninteractive
@@ -32,9 +33,13 @@ WORKDIR /app
 COPY requirements.txt .
 
 # Install PyTorch with CUDA support and other dependencies
+ARG PYTORCH_VERSION=2.8.0
+ARG TORCHVISION_VERSION=0.23.0
+ARG TORCHAUDIO_VERSION=2.8.0
+ARG PYTORCH_CUDA_INDEX=cu129
 RUN pip install --no-cache-dir --break-system-packages \
-    torch==2.7.0 torchvision==0.22.0 torchaudio==2.7.0 \
-    --index-url https://download.pytorch.org/whl/cu126 && \
+    torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} \
+    --index-url https://download.pytorch.org/whl/${PYTORCH_CUDA_INDEX} && \
     pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy application code

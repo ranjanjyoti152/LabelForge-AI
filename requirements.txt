@@ -9,7 +9,7 @@ Pillow>=10.3
 huggingface_hub>=1.1
 einops>=0.8
 decord>=0.6.0
-pycocotools>=2.0
+pycocotools>=2.0.10
 psutil>=5.9
 requests>=2.31
 sam3 @ git+https://github.com/facebookresearch/sam3.git
