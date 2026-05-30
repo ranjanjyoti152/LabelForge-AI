@@ -280,8 +280,9 @@ python tools/prepare_yolo_dataset.py \
 | `--auto-label` | Auto-label with SAM3 | `false` |
 | `--use-existing` | Use Label Studio annotations | `false` |
 | `--batch-size` | Tasks per batch | `10` |
-| `--workers` | Parallel download workers | `4` |
-| `--max-workers` | Use all CPU cores for workers and raise batch size | `false` |
+| `--sam3-batch-size` | Images per SAM3 `/predict` request | `4` |
+| `--workers` | Parallel download workers; `0` means CPU-core count | `4` |
+| `--max-workers` | Use all CPU cores and match download batch size | `false` |
 | `--save-preview` | Save preview images | `false` |
 | `--max-tasks` | Limit tasks (0 = all) | `0` |
 | `--train-split` | Train ratio | `0.8` |

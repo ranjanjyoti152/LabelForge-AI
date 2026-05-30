@@ -127,14 +127,31 @@ SAM3_MIN_BOX_AREA = int(os.environ.get("SAM3_MIN_BOX_AREA", "500"))
 SAM3_MAX_DETECTIONS = int(os.environ.get("SAM3_MAX_DETECTIONS", "25"))
 SAM3_CROSS_CLASS_NMS = os.environ.get("SAM3_CROSS_CLASS_NMS", "true").lower() == "true"
 
+def cpu_worker_count() -> int:
+    """Return available CPU cores, respecting Linux CPU affinity when present."""
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return max(1, len(os.sched_getaffinity(0)))
+        except Exception:
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
+def parse_worker_count(value: str, default: int) -> int:
+    """Parse worker count values, allowing auto/max/all/0 for CPU-core count."""
+    value = str(value).strip().lower()
+    if value in ("auto", "max", "all", "0"):
+        return cpu_worker_count()
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return default
+
+
 # Batch processing configuration
 DEFAULT_BATCH_SIZE = int(os.environ.get("YOLO_BATCH_SIZE", "10"))
-DEFAULT_WORKERS = int(os.environ.get("YOLO_WORKERS", "4"))
-
-
-def cpu_worker_count() -> int:
-    """Return a practical worker count from available CPU cores."""
-    return max(1, os.cpu_count() or DEFAULT_WORKERS)
+DEFAULT_WORKERS = parse_worker_count(os.environ.get("YOLO_WORKERS", "4"), 4)
+DEFAULT_SAM3_BATCH_SIZE = int(os.environ.get("YOLO_SAM3_BATCH_SIZE", "4"))
 
 # Dataset balancing / Cosmos Predict2.5 configuration
 DEFAULT_MIN_SAMPLES_PER_CLASS = int(os.environ.get("DATASET_MIN_SAMPLES_PER_CLASS", "300"))
@@ -147,6 +164,8 @@ DEFAULT_LM_STUDIO_API_BASE = os.environ.get(
 )
 DEFAULT_LM_STUDIO_MODEL = os.environ.get("LM_STUDIO_MODEL", os.environ.get("LMSTUDIO_MODEL", ""))
 DEFAULT_LM_STUDIO_API_KEY = os.environ.get("LM_STUDIO_API_KEY", os.environ.get("LMSTUDIO_API_KEY", "lm-studio"))
+DEFAULT_LABEL_STUDIO_TIMEOUT = int(os.environ.get("LABEL_STUDIO_REQUEST_TIMEOUT", "30"))
+DEFAULT_IMAGE_DOWNLOAD_TIMEOUT = int(os.environ.get("IMAGE_DOWNLOAD_TIMEOUT", "30"))
 
 
 class Colors:
@@ -216,6 +235,8 @@ class Stats:
         self.total_annotations = 0
         self.total_bytes_downloaded = 0
         self.class_counts: Dict[str, int] = {}
+        self.skipped_reasons: Dict[str, int] = {}
+        self.failed_reasons: Dict[str, int] = {}
         self._lock = Lock()
     
     def add_annotations(self, count: int, labels: List[str]):
@@ -233,15 +254,17 @@ class Stats:
             self.processed += 1
             self.success += 1
     
-    def increment_skipped(self):
+    def increment_skipped(self, reason: str = "skipped"):
         with self._lock:
             self.processed += 1
             self.skipped += 1
+            self.skipped_reasons[reason] = self.skipped_reasons.get(reason, 0) + 1
     
-    def increment_failed(self):
+    def increment_failed(self, reason: str = "failed"):
         with self._lock:
             self.processed += 1
             self.failed += 1
+            self.failed_reasons[reason] = self.failed_reasons.get(reason, 0) + 1
     
     def elapsed(self) -> float:
         return time.time() - self.start_time
@@ -319,6 +342,16 @@ class Stats:
                 bar = '█' * bar_width
                 print(f"    {label:20s} {Colors.CYAN}{bar}{Colors.ENDC} {count}")
 
+        if self.skipped_reasons:
+            print(f"\n  {Colors.BOLD}Skipped Reasons:{Colors.ENDC}")
+            for reason, count in sorted(self.skipped_reasons.items(), key=lambda x: -x[1]):
+                print(f"    {reason:24s} {Colors.YELLOW}{count}{Colors.ENDC}")
+
+        if self.failed_reasons:
+            print(f"\n  {Colors.BOLD}Failed Reasons:{Colors.ENDC}")
+            for reason, count in sorted(self.failed_reasons.items(), key=lambda x: -x[1]):
+                print(f"    {reason:24s} {Colors.RED}{count}{Colors.ENDC}")
+
 
 class LabelStudioClient:
     """Client for Label Studio API."""
@@ -333,14 +366,14 @@ class LabelStudioClient:
     def get_project(self, project_id: int) -> Dict[str, Any]:
         """Get project details including label config."""
         url = f"{self.base_url}/api/projects/{project_id}"
-        resp = self.session.get(url)
+        resp = self.session.get(url, timeout=DEFAULT_LABEL_STUDIO_TIMEOUT)
         resp.raise_for_status()
         return resp.json()
 
     def get_task_count(self, project_id: int) -> int:
         """Get total number of tasks in project."""
         url = f"{self.base_url}/api/projects/{project_id}"
-        resp = self.session.get(url)
+        resp = self.session.get(url, timeout=DEFAULT_LABEL_STUDIO_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         return data.get("task_number", 0)
@@ -359,7 +392,7 @@ class LabelStudioClient:
         while True:
             url = f"{self.base_url}/api/projects/{project_id}/tasks"
             params = {"page": page, "page_size": page_size}
-            resp = self.session.get(url, params=params)
+            resp = self.session.get(url, params=params, timeout=DEFAULT_LABEL_STUDIO_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
             
@@ -406,7 +439,7 @@ class LabelStudioClient:
         while True:
             url = f"{self.base_url}/api/projects/{project_id}/tasks"
             params = {"page": page, "page_size": page_size}
-            resp = self.session.get(url, params=params)
+            resp = self.session.get(url, params=params, timeout=DEFAULT_LABEL_STUDIO_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
             
@@ -435,7 +468,7 @@ class LabelStudioClient:
         while True:
             url = f"{self.base_url}/api/projects/{project_id}/tasks"
             params = {"page": page, "page_size": batch_size}
-            resp = self.session.get(url, params=params)
+            resp = self.session.get(url, params=params, timeout=DEFAULT_LABEL_STUDIO_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
             
@@ -786,7 +819,7 @@ def download_image(url: str, output_path: Path, headers: Dict[str, str] = None, 
     """Download image and return bytes downloaded."""
     try:
         requester = session if session else requests
-        resp = requester.get(url, headers=headers, timeout=30, stream=True)
+        resp = requester.get(url, headers=headers, timeout=DEFAULT_IMAGE_DOWNLOAD_TIMEOUT, stream=True)
         resp.raise_for_status()
         
         total_bytes = 0
@@ -805,7 +838,7 @@ def download_image_to_memory(url: str, headers: Dict[str, str] = None, session: 
     """Download image to memory and return bytes."""
     try:
         requester = session if session else requests
-        resp = requester.get(url, headers=headers, timeout=30)
+        resp = requester.get(url, headers=headers, timeout=DEFAULT_IMAGE_DOWNLOAD_TIMEOUT)
         resp.raise_for_status()
         return resp.content
     except Exception:
@@ -868,6 +901,7 @@ def process_batch(
     project_labels: List[str] = None,
     preview_dir: Optional[Path] = None,
     num_workers: int = 4,
+    sam3_batch_size: int = DEFAULT_SAM3_BATCH_SIZE,
 ) -> None:
     """
     Process a batch of tasks with parallel downloads and batch SAM3 prediction.
@@ -888,7 +922,7 @@ def process_batch(
             if status == "success" and image_data is not None:
                 downloaded[task_id] = (image_data, filename, task_map[task_id])
             else:
-                stats.increment_skipped()
+                stats.increment_skipped(status)
     
     if not downloaded:
         return
@@ -911,13 +945,28 @@ def process_batch(
             need_auto_label.append((task_id, image_base64))
         else:
             # No annotations and no auto-label - mark as skipped
-            stats.increment_skipped()
+            stats.increment_skipped("no_annotations")
     
     # Step 3: Batch SAM3 prediction for tasks needing auto-labeling
     if need_auto_label and sam3_client:
         concepts = project_labels or list(label_to_id.keys())
-        try:
-            sam3_results = sam3_client.predict_batch(need_auto_label, concepts)
+        for batch_start in range(0, len(need_auto_label), max(1, sam3_batch_size)):
+            sam3_chunk = need_auto_label[batch_start:batch_start + max(1, sam3_batch_size)]
+            try:
+                sam3_results = sam3_client.predict_batch(sam3_chunk, concepts)
+            except requests.exceptions.ConnectionError:
+                for task_id, _ in sam3_chunk:
+                    stats.increment_failed("sam3_connection_error")
+                continue
+            except requests.exceptions.Timeout:
+                for task_id, _ in sam3_chunk:
+                    stats.increment_failed("sam3_timeout")
+                continue
+            except Exception as e:
+                reason = f"sam3_error:{type(e).__name__}"
+                for task_id, _ in sam3_chunk:
+                    stats.increment_failed(reason)
+                continue
             
             for task_id, results in sam3_results.items():
                 annotations = []
@@ -936,17 +985,7 @@ def process_batch(
                 if annotations:
                     annotations_map[task_id] = annotations
                 else:
-                    stats.increment_skipped()
-                    
-        except requests.exceptions.ConnectionError:
-            for task_id, _ in need_auto_label:
-                stats.increment_failed()
-        except requests.exceptions.Timeout:
-            for task_id, _ in need_auto_label:
-                stats.increment_failed()
-        except Exception as e:
-            for task_id, _ in need_auto_label:
-                stats.increment_failed()
+                    stats.increment_skipped("sam3_no_detections")
     
     # Step 4: Save images and labels (can be done in parallel)
     def save_task(task_id: int) -> Tuple[bool, str]:
@@ -998,7 +1037,7 @@ def process_batch(
             if success:
                 stats.increment_success()
             else:
-                stats.increment_skipped()
+                stats.increment_skipped(reason)
 
 
 def process_task(
@@ -1047,7 +1086,7 @@ def process_task(
         # Skip invalid URLs
         if not image_url.startswith(("http://", "https://")):
             return False, "invalid_url"
-        resp = requests.get(image_url, headers=ls_client.headers, timeout=30)
+        resp = requests.get(image_url, headers=ls_client.headers, timeout=DEFAULT_IMAGE_DOWNLOAD_TIMEOUT)
         resp.raise_for_status()
         image_data = resp.content
         stats.total_bytes_downloaded += len(image_data)
@@ -1567,6 +1606,8 @@ def write_quality_report(
     project: Dict[str, Any],
     labels: List[str],
     real_counts: Dict[str, int],
+    skipped_reasons: Dict[str, int],
+    failed_reasons: Dict[str, int],
     weak_classes: List[Dict[str, Any]],
     prompts_path: Optional[Path],
     synthetic_report: Optional[Dict[str, Any]],
@@ -1577,6 +1618,8 @@ def write_quality_report(
         "project_title": project.get("title", "Unknown"),
         "labels": labels,
         "real_class_counts": {label: int(real_counts.get(label, 0)) for label in labels},
+        "skipped_reasons": skipped_reasons,
+        "failed_reasons": failed_reasons,
         "weak_classes": weak_classes,
         "cosmos_prompts": str(prompts_path) if prompts_path else None,
         "synthetic": synthetic_report,
@@ -1628,11 +1671,13 @@ Examples:
     parser.add_argument("--max-tasks", type=int, default=0,
                         help="Maximum number of tasks to process (0 = all)")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
-                        help=f"Number of tasks to process per batch (default: {DEFAULT_BATCH_SIZE})")
+                        help=f"Number of tasks to download/process per batch (default: {DEFAULT_BATCH_SIZE})")
+    parser.add_argument("--sam3-batch-size", type=int, default=DEFAULT_SAM3_BATCH_SIZE,
+                        help=f"Images per SAM3 /predict request (default: {DEFAULT_SAM3_BATCH_SIZE})")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
-                        help=f"Number of parallel workers for downloads (default: {DEFAULT_WORKERS})")
+                        help=f"Number of parallel workers for downloads; use 0 for CPU-core count (default: {DEFAULT_WORKERS})")
     parser.add_argument("--max-workers", action="store_true",
-                        help="Use all available CPU cores for download/processing workers and raise batch size if needed")
+                        help="Use all available CPU cores for download/processing workers")
     parser.add_argument("--no-batch", action="store_true",
                         help="Disable batch processing (process one-by-one)")
     parser.add_argument("--balance-classes", action="store_true",
@@ -1672,7 +1717,9 @@ Examples:
         args.balance_classes = True
     if args.max_workers:
         args.workers = cpu_worker_count()
-        args.batch_size = max(args.batch_size, args.workers * 2)
+        args.batch_size = max(args.batch_size, args.workers)
+    elif args.workers <= 0:
+        args.workers = cpu_worker_count()
     
     # Validate arguments
     if not args.use_existing and not args.auto_label:
@@ -1699,7 +1746,8 @@ Examples:
   Balance Classes: {'Yes' if args.balance_classes else 'No'}
   Cosmos Augment:  {'Yes' if args.cosmos_augment else 'No'}
   Split Ratio:     train={args.train_split}, val={args.val_split}, test={args.test_split}
-  Batch Mode:      {'Disabled' if args.no_batch else f'Yes (batch_size={args.batch_size}, workers={args.workers})'}
+  CPU Cores:       {cpu_worker_count()}
+  Batch Mode:      {'Disabled' if args.no_batch else f'Yes (batch_size={args.batch_size}, sam3_batch_size={args.sam3_batch_size}, workers={args.workers})'}
 """)
     
     if args.auto_label or args.cosmos_augment:
@@ -1828,7 +1876,7 @@ Examples:
         print(f"{Colors.CYAN}ℹ Auto-labeling with {len(labels)} concepts: {concepts_preview}{Colors.ENDC}")
     
     if not args.no_batch:
-        print(f"{Colors.CYAN}ℹ Batch size: {args.batch_size}, Workers: {args.workers}{Colors.ENDC}")
+        print(f"{Colors.CYAN}ℹ Batch size: {args.batch_size}, SAM3 batch size: {args.sam3_batch_size}, Workers: {args.workers}{Colors.ENDC}")
     
     stats = Stats()
     stats.total_tasks = total_tasks
@@ -1856,17 +1904,16 @@ Examples:
             )
             
             tasks_processed += 1
-            stats.processed += 1
             if success:
-                stats.success += 1
+                stats.increment_success()
             elif reason in ("no_annotations", "no_valid_boxes", "no_image_url", "download_failed", "invalid_url"):
-                stats.skipped += 1
+                stats.increment_skipped(reason)
             elif reason and reason.startswith("sam3_"):
                 # SAM3 related errors - these are failures, not skips
-                stats.failed += 1
+                stats.increment_failed(reason)
                 print(f"\n  {Colors.RED}✗ Task {task_id}: {reason}{Colors.ENDC}")
             else:
-                stats.failed += 1
+                stats.increment_failed(reason or "unknown")
                 if reason:
                     print(f"\n  {Colors.RED}✗ Task {task_id}: {reason}{Colors.ENDC}")
             
@@ -1895,6 +1942,7 @@ Examples:
                 project_labels=labels,
                 preview_dir=preview_dir,
                 num_workers=args.workers,
+                sam3_batch_size=args.sam3_batch_size,
             )
             
             stats.print_progress(batch_info=batch_info)
@@ -1990,7 +2038,17 @@ Examples:
         except subprocess.CalledProcessError as e:
             print(f"{Colors.RED}✗ Cosmos generation failed with exit code {e.returncode}{Colors.ENDC}")
             print("  Fix the Cosmos Docker run, then rerun with --cosmos-augment.")
-            write_quality_report(output_dir, project, labels, real_class_counts, weak_classes, prompts_path, None)
+            write_quality_report(
+                output_dir,
+                project,
+                labels,
+                real_class_counts,
+                dict(stats.skipped_reasons),
+                dict(stats.failed_reasons),
+                weak_classes,
+                prompts_path,
+                None,
+            )
             sys.exit(1)
 
         print(f"{Colors.CYAN}ℹ Labeling Cosmos frames with SAM3...{Colors.ENDC}")
@@ -2017,6 +2075,8 @@ Examples:
             project,
             labels,
             real_class_counts,
+            dict(stats.skipped_reasons),
+            dict(stats.failed_reasons),
             weak_classes,
             prompts_path,
             synthetic_report,
