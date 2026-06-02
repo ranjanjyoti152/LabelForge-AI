@@ -1,0 +1,13 @@
+[
+  {
+    "class_name": "car",
+    "name": "smoke_test_car",
+    "inference_type": "text2world",
+    "prompt": "Realistic traffic camera video of one clearly visible car on an Indian urban road in daylight, natural motion, practical lighting, no text overlay.",
+    "negative_prompt": "text, watermark, logo, cartoon, blurry, distorted vehicle, unrealistic scale, heavy occlusion",
+    "count": 1,
+    "seed": 101,
+    "num_output_frames": 16,
+    "num_steps": 4
+  }
+]

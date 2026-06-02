@@ -304,6 +304,13 @@ async def _predict_for_task(
             sampled_frames = await run_in_threadpool(sampler.sample, 1, frame_skip)
         except RtspStreamError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not sampled_frames:
+            return {
+                "task": task.id,
+                "result": [],
+                "score": 0.0,
+                "model_version": settings.labelstudio_model_version,
+            }
         frame = sampled_frames[0].image
     else:
         # Handle HTTP image URLs
@@ -332,13 +339,14 @@ async def _predict_for_task(
         concepts,
     )
     
-    # Scale bounding boxes back to original image size if resized
+    # Scale bounding boxes and area back to original image size if resized
     if scale != 1.0:
         for det in detections:
             det.bbox["x"] = int(det.bbox["x"] / scale)
             det.bbox["y"] = int(det.bbox["y"] / scale)
             det.bbox["width"] = int(det.bbox["width"] / scale)
             det.bbox["height"] = int(det.bbox["height"] / scale)
+            det.area = int(det.area / (scale * scale))
 
     result_items = _format_label_studio_results(
         detections,
@@ -423,8 +431,7 @@ def _fetch_image_as_cv2(image_url: str, settings: Settings) -> np.ndarray | None
             return _decode_base64_image(image_url)
         
         # Handle Label Studio local file URLs
-        if image_url.startswith("/data/"):
-            # Construct full URL using Label Studio base
+        if image_url.startswith("/data/") and settings.labelstudio_api_base:
             api_base = settings.labelstudio_api_base.rstrip("/")
             image_url = f"{api_base}{image_url}"
 

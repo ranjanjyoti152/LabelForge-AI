@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import ContextManager, Dict, Iterable, List, Sequence
 import importlib.util
 import os
 import shutil
@@ -389,6 +390,12 @@ class Sam3Detector:
             raise ValueError("At least one concept prompt must be configured before running detection.")
         return prompts
 
+    def _inference_autocast(self) -> ContextManager[None]:
+        """SAM3's fused ViT path emits bf16 activations; autocast keeps later layers compatible."""
+        if self.device.type in {"cuda", "cpu"}:
+            return torch.autocast(device_type=self.device.type, dtype=torch.bfloat16)
+        return nullcontext()
+
     def detect(
         self,
         frame: np.ndarray,
@@ -404,7 +411,7 @@ class Sam3Detector:
         pil_frame = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         
         # Set image once - this is the expensive operation
-        with torch.inference_mode():
+        with torch.inference_mode(), self._inference_autocast():
             state = self._processor.set_image(pil_frame)
 
             detections: List[Detection] = []

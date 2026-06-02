@@ -148,10 +148,91 @@ def parse_worker_count(value: str, default: int) -> int:
         return default
 
 
+def gpu_memory_mb() -> Tuple[Optional[int], Optional[int]]:
+    """Return (free_mb, total_mb) for the largest visible NVIDIA GPU."""
+    if shutil.which("nvidia-smi") is None:
+        return None, None
+
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=memory.free,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None, None
+
+    best: Tuple[Optional[int], Optional[int]] = (None, None)
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            free_mb = int(parts[0])
+            total_mb = int(parts[1])
+        except ValueError:
+            continue
+        if best[1] is None or total_mb > best[1]:
+            best = (free_mb, total_mb)
+    return best
+
+
+def sam3_batch_size_for_vram(total_mb: Optional[int], free_mb: Optional[int]) -> int:
+    """Choose a conservative SAM3 request batch size from detected VRAM."""
+    if total_mb is None:
+        return 4
+
+    if total_mb < 8_000:
+        batch_size = 2
+    elif total_mb < 12_000:
+        batch_size = 4
+    elif total_mb < 16_000:
+        batch_size = 6
+    elif total_mb < 24_000:
+        batch_size = 8
+    elif total_mb < 32_000:
+        batch_size = 12
+    elif total_mb < 48_000:
+        batch_size = 16
+    elif total_mb < 80_000:
+        batch_size = 24
+    else:
+        batch_size = 32
+
+    if free_mb is not None:
+        if free_mb < 4_000:
+            batch_size = 1
+        elif free_mb < 8_000:
+            batch_size = min(batch_size, 4)
+        elif free_mb < 12_000:
+            batch_size = min(batch_size, 8)
+
+    return max(1, batch_size)
+
+
+def parse_sam3_batch_size(value: str | int, default: int = 4) -> int:
+    """Parse SAM3 batch size, allowing auto/max/all/0 to size from NVIDIA VRAM."""
+    value = str(value).strip().lower()
+    if value in ("auto", "max", "all", "0"):
+        free_mb, total_mb = gpu_memory_mb()
+        return sam3_batch_size_for_vram(total_mb, free_mb)
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return default
+
+
 # Batch processing configuration
 DEFAULT_BATCH_SIZE = int(os.environ.get("YOLO_BATCH_SIZE", "10"))
 DEFAULT_WORKERS = parse_worker_count(os.environ.get("YOLO_WORKERS", "4"), 4)
-DEFAULT_SAM3_BATCH_SIZE = int(os.environ.get("YOLO_SAM3_BATCH_SIZE", "4"))
+DEFAULT_SAM3_BATCH_SIZE_RAW = os.environ.get("YOLO_SAM3_BATCH_SIZE", "auto")
+DEFAULT_SAM3_BATCH_SIZE = parse_sam3_batch_size(DEFAULT_SAM3_BATCH_SIZE_RAW, 4)
 
 # Dataset balancing / Cosmos Predict2.5 configuration
 DEFAULT_MIN_SAMPLES_PER_CLASS = int(os.environ.get("DATASET_MIN_SAMPLES_PER_CLASS", "300"))
@@ -235,15 +316,18 @@ class Stats:
         self.total_annotations = 0
         self.total_bytes_downloaded = 0
         self.class_counts: Dict[str, int] = {}
+        self.class_image_counts: Dict[str, int] = {}
         self.skipped_reasons: Dict[str, int] = {}
         self.failed_reasons: Dict[str, int] = {}
         self._lock = Lock()
-    
+
     def add_annotations(self, count: int, labels: List[str]):
         with self._lock:
             self.total_annotations += count
             for label in labels:
                 self.class_counts[label] = self.class_counts.get(label, 0) + 1
+            for label in set(labels):
+                self.class_image_counts[label] = self.class_image_counts.get(label, 0) + 1
     
     def add_bytes(self, bytes_count: int):
         with self._lock:
@@ -1089,7 +1173,7 @@ def process_task(
         resp = requests.get(image_url, headers=ls_client.headers, timeout=DEFAULT_IMAGE_DOWNLOAD_TIMEOUT)
         resp.raise_for_status()
         image_data = resp.content
-        stats.total_bytes_downloaded += len(image_data)
+        stats.add_bytes(len(image_data))
     except Exception as e:
         return False, "download_failed"
     
@@ -1137,7 +1221,7 @@ def process_task(
         f.write(image_data)
     
     # Save labels
-    label_path = labels_dir / f"{filename}.txt"
+    label_path = labels_dir / f"{Path(filename).stem}.txt"
     with open(label_path, "w") as f:
         f.write("\n".join(yolo_lines))
     
@@ -1505,7 +1589,20 @@ def load_job_class_map(jobs_dir: Path) -> Dict[str, str]:
     job_map: Dict[str, str] = {}
     if not jobs_dir.exists():
         return job_map
+
+    class_map_path = jobs_dir / "_class_map.json"
+    if class_map_path.exists():
+        try:
+            with open(class_map_path, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                job_map.update({str(k): str(v) for k, v in data.items()})
+        except Exception:
+            pass
+
     for job_path in sorted(jobs_dir.glob("*.json")):
+        if job_path.name == "_class_map.json":
+            continue
         try:
             with open(job_path, "r") as f:
                 data = json.load(f)
@@ -1565,7 +1662,19 @@ def label_synthetic_frames(
             image_data = frame_path.read_bytes()
             image_base64 = base64.b64encode(image_data).decode("utf-8")
             annotations = sam3_client.predict_with_base64(image_base64, [class_name])
-            annotations = [ann for ann in annotations if ann.get("label") == class_name]
+            parsed_annotations = []
+            for result in annotations:
+                value = result.get("value", {})
+                labels = value.get("rectanglelabels", [])
+                if labels and labels[0] == class_name:
+                    parsed_annotations.append({
+                        "label": labels[0],
+                        "x": value.get("x", 0),
+                        "y": value.get("y", 0),
+                        "width": value.get("width", 0),
+                        "height": value.get("height", 0),
+                    })
+            annotations = parsed_annotations
             yolo_lines = convert_to_yolo_format(annotations, label_to_id)
         except Exception as e:
             report["rejected_images"] += 1
@@ -1672,14 +1781,16 @@ Examples:
                         help="Maximum number of tasks to process (0 = all)")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE,
                         help=f"Number of tasks to download/process per batch (default: {DEFAULT_BATCH_SIZE})")
-    parser.add_argument("--sam3-batch-size", type=int, default=DEFAULT_SAM3_BATCH_SIZE,
-                        help=f"Images per SAM3 /predict request (default: {DEFAULT_SAM3_BATCH_SIZE})")
+    parser.add_argument("--sam3-batch-size", type=str, default=str(DEFAULT_SAM3_BATCH_SIZE),
+                        help=f"Images per SAM3 /predict request; use auto/0 to size from VRAM (default: {DEFAULT_SAM3_BATCH_SIZE})")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"Number of parallel workers for downloads; use 0 for CPU-core count (default: {DEFAULT_WORKERS})")
     parser.add_argument("--max-workers", action="store_true",
                         help="Use all available CPU cores for download/processing workers")
     parser.add_argument("--no-batch", action="store_true",
                         help="Disable batch processing (process one-by-one)")
+    parser.add_argument("--preload-tasks", action="store_true",
+                        help="Fetch all Label Studio task metadata before processing (old behavior)")
     parser.add_argument("--balance-classes", action="store_true",
                         help="Report classes below --min-samples-per-class")
     parser.add_argument("--cosmos-augment", action="store_true",
@@ -1712,6 +1823,7 @@ Examples:
                         help="LM Studio request timeout in seconds")
     
     args = parser.parse_args()
+    args.sam3_batch_size = parse_sam3_batch_size(args.sam3_batch_size, DEFAULT_SAM3_BATCH_SIZE)
 
     if args.cosmos_augment:
         args.balance_classes = True
@@ -1720,12 +1832,20 @@ Examples:
         args.batch_size = max(args.batch_size, args.workers)
     elif args.workers <= 0:
         args.workers = cpu_worker_count()
+
+    if (args.auto_label or args.cosmos_augment) and not args.no_batch:
+        args.batch_size = max(args.batch_size, args.sam3_batch_size)
     
     # Validate arguments
     if not args.use_existing and not args.auto_label:
         print(f"{Colors.YELLOW}⚠ Neither --use-existing nor --auto-label specified.")
         print(f"  Defaulting to --use-existing{Colors.ENDC}")
         args.use_existing = True
+
+    total_split = args.train_split + args.val_split + args.test_split
+    if abs(total_split - 1.0) > 0.001:
+        print(f"{Colors.RED}✗ --train-split + --val-split + --test-split must equal 1.0, got {total_split:.4f}{Colors.ENDC}")
+        sys.exit(1)
     
     if not args.ls_token:
         print(f"{Colors.RED}✗ Label Studio API token required. Set SAM3_LABELSTUDIO_API_TOKEN or use --ls-token{Colors.ENDC}")
@@ -1747,16 +1867,21 @@ Examples:
   Cosmos Augment:  {'Yes' if args.cosmos_augment else 'No'}
   Split Ratio:     train={args.train_split}, val={args.val_split}, test={args.test_split}
   CPU Cores:       {cpu_worker_count()}
+  Task Loading:    {'Preload all tasks' if args.preload_tasks or args.no_batch else 'Stream batches'}
   Batch Mode:      {'Disabled' if args.no_batch else f'Yes (batch_size={args.batch_size}, sam3_batch_size={args.sam3_batch_size}, workers={args.workers})'}
 """)
     
     if args.auto_label or args.cosmos_augment:
+        free_mb, total_mb = gpu_memory_mb()
         print(f"  {Colors.BOLD}SAM3 Detection Config (from .env):{Colors.ENDC}")
         print(f"    • Score Threshold:  {SAM3_SCORE_THRESHOLD}")
         print(f"    • NMS Threshold:    {SAM3_NMS_THRESHOLD}")
         print(f"    • Min Box Area:     {SAM3_MIN_BOX_AREA}")
         print(f"    • Max Detections:   {SAM3_MAX_DETECTIONS}")
         print(f"    • Cross-Class NMS:  {SAM3_CROSS_CLASS_NMS}")
+        if total_mb is not None:
+            print(f"    • GPU VRAM:         {free_mb}MB free / {total_mb}MB total")
+        print(f"    • SAM3 Batch Size:  {args.sam3_batch_size}")
         print()
 
     if args.cosmos_augment:
@@ -1807,24 +1932,26 @@ Examples:
     
     label_to_id = {label: i for i, label in enumerate(labels)}
     
-    # Fetch all tasks with progress bar
+    # Fetch task count, then either stream task batches or preload task metadata.
     print_section("Fetching Tasks from Label Studio")
+    all_tasks: List[Dict[str, Any]] = []
     try:
-        total_tasks = ls_client.get_task_count(args.project_id)
-        print(f"{Colors.CYAN}ℹ Project has {total_tasks} total tasks{Colors.ENDC}")
+        project_task_count = ls_client.get_task_count(args.project_id)
+        total_tasks = project_task_count
+        if args.max_tasks > 0:
+            total_tasks = min(project_task_count, args.max_tasks)
+        print(f"{Colors.CYAN}ℹ Project has {project_task_count} total tasks{Colors.ENDC}")
         
         if args.max_tasks > 0:
             print(f"{Colors.CYAN}ℹ Will fetch up to {args.max_tasks} tasks (--max-tasks){Colors.ENDC}")
-        
-        print(f"{Colors.CYAN}ℹ Fetching tasks...{Colors.ENDC}")
-        all_tasks = ls_client.get_all_tasks(args.project_id, max_tasks=args.max_tasks, show_progress=True)
-        print(f"{Colors.GREEN}✓ Fetched {len(all_tasks)} tasks successfully!{Colors.ENDC}")
-        
-        total_tasks = len(all_tasks)
-        if args.max_tasks > 0 and total_tasks > args.max_tasks:
-            all_tasks = all_tasks[:args.max_tasks]
-            total_tasks = args.max_tasks
-            print(f"{Colors.YELLOW}  (limited to {args.max_tasks} by --max-tasks){Colors.ENDC}")
+
+        if args.preload_tasks or args.no_batch:
+            print(f"{Colors.CYAN}ℹ Preloading task metadata...{Colors.ENDC}")
+            all_tasks = ls_client.get_all_tasks(args.project_id, max_tasks=args.max_tasks, show_progress=True)
+            total_tasks = len(all_tasks)
+            print(f"{Colors.GREEN}✓ Fetched {len(all_tasks)} tasks successfully!{Colors.ENDC}")
+        else:
+            print(f"{Colors.CYAN}ℹ Streaming task batches; download + labeling starts immediately.{Colors.ENDC}")
             
     except Exception as e:
         print(f"{Colors.RED}✗ Failed to fetch tasks: {e}{Colors.ENDC}")
@@ -1919,13 +2046,29 @@ Examples:
             
             stats.print_progress(task_id)
     else:
-        # Batch processing mode - process pre-fetched tasks in chunks
+        # Batch processing mode - stream task batches by default so fetch/download/labeling overlap by page.
         batch_num = 0
         batch_size = args.batch_size
-        
-        # Split all_tasks into batches
-        for i in range(0, len(all_tasks), batch_size):
-            batch = all_tasks[i:i + batch_size]
+
+        if args.preload_tasks:
+            batch_iter = (
+                all_tasks[i:i + batch_size]
+                for i in range(0, len(all_tasks), batch_size)
+            )
+        else:
+            batch_iter = ls_client.iter_task_batches(args.project_id, batch_size=batch_size)
+
+        streamed_tasks = 0
+        for batch in batch_iter:
+            if args.max_tasks > 0:
+                remaining = args.max_tasks - streamed_tasks
+                if remaining <= 0:
+                    break
+                batch = batch[:remaining]
+            if not batch:
+                break
+
+            streamed_tasks += len(batch)
             batch_num += 1
             batch_info = f"Batch {batch_num} ({len(batch)} tasks)"
             
@@ -1953,6 +2096,7 @@ Examples:
     stats.print_summary()
 
     real_class_counts = dict(stats.class_counts)
+    real_class_image_counts = dict(stats.class_image_counts)
     weak_classes: List[Dict[str, Any]] = []
     prompts_path: Optional[Path] = None
     synthetic_report: Optional[Dict[str, Any]] = None
@@ -1960,17 +2104,17 @@ Examples:
     if args.balance_classes:
         weak_classes = identify_weak_classes(
             labels,
-            real_class_counts,
+            real_class_image_counts,
             args.min_samples_per_class,
             args.synthetic_max_ratio,
             args.cosmos_frames_per_video,
         )
         print_section("Class Balance")
         if weak_classes:
-            print(f"{Colors.YELLOW}⚠ {len(weak_classes)} class(es) below {args.min_samples_per_class} boxes:{Colors.ENDC}")
+            print(f"{Colors.YELLOW}⚠ {len(weak_classes)} class(es) below {args.min_samples_per_class} images:{Colors.ENDC}")
             for weak in weak_classes:
                 print(
-                    f"    {weak['class_name']}: {weak['current_count']} boxes, "
+                    f"    {weak['class_name']}: {weak['current_count']} images, "
                     f"need {weak['deficit']}, planned synthetic frames <= {weak['target_synthetic_frames']}"
                 )
         else:

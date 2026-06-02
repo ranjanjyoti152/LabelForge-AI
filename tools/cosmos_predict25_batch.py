@@ -35,6 +35,7 @@ def container_input_path(input_path: str) -> str:
 def expand_jobs(prompts: List[Dict[str, Any]], jobs_dir: Path, default_inference_type: str) -> List[Path]:
     jobs_dir.mkdir(parents=True, exist_ok=True)
     job_paths: List[Path] = []
+    class_map: Dict[str, str] = {}
 
     for prompt_item in prompts:
         class_name = prompt_item.get("class_name")
@@ -43,6 +44,8 @@ def expand_jobs(prompts: List[Dict[str, Any]], jobs_dir: Path, default_inference
             raise ValueError("Each prompt item requires class_name and prompt.")
 
         count = int(prompt_item.get("count", 1))
+        if count <= 0:
+            raise ValueError(f"Prompt count must be positive, got {count} for class '{class_name}'.")
         base_name = prompt_item.get("name") or str(class_name).replace(" ", "_")
         inference_type = prompt_item.get("inference_type", default_inference_type)
 
@@ -52,8 +55,8 @@ def expand_jobs(prompts: List[Dict[str, Any]], jobs_dir: Path, default_inference
                 "inference_type": inference_type,
                 "name": name,
                 "prompt": prompt,
-                "class_name": class_name,
             }
+            class_map[name] = class_name
 
             if prompt_item.get("negative_prompt"):
                 job["negative_prompt"] = prompt_item["negative_prompt"]
@@ -78,6 +81,10 @@ def expand_jobs(prompts: List[Dict[str, Any]], jobs_dir: Path, default_inference
                 json.dump(job, f, indent=2)
                 f.write("\n")
             job_paths.append(job_path)
+
+    with open(jobs_dir / "_class_map.json", "w") as f:
+        json.dump(class_map, f, indent=2)
+        f.write("\n")
 
     return job_paths
 
@@ -109,6 +116,7 @@ def run_cosmos_job(compose_file: Path, job_path: Path, output_dir: Path, model: 
     cmd = cosmos_compose_cmd(compose_file) + [
         "run",
         "--rm",
+        "--no-deps",
         cosmos_service_name(),
         "python",
         "examples/inference.py",

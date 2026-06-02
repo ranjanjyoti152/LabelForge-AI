@@ -30,7 +30,8 @@ services:
     env_file:
       - .env
     environment:
-      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_VISIBLE_DEVICES: ${SAM3_NVIDIA_VISIBLE_DEVICES:-0}
+      CUDA_VISIBLE_DEVICES: ${SAM3_CUDA_VISIBLE_DEVICES:-0}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     
     # Persist model weights and datasets
@@ -55,7 +56,8 @@ services:
   #
   cosmos:
     depends_on:
-      - sam3-auto-labeler
+      sam3-auto-labeler:
+        condition: service_healthy
     build:
       context: ${COSMOS_PREDICT25_REPO:-../cosmos-predict2.5}
       dockerfile: Dockerfile
@@ -68,9 +70,10 @@ services:
     stdin_open: true
     tty: true
     environment:
-      HF_TOKEN: ${HF_TOKEN:-}
+      HF_TOKEN: ${HF_TOKEN:-${SAM3_HF_TOKEN:-}}
       HF_HOME: /root/.cache/huggingface
-      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_VISIBLE_DEVICES: ${COSMOS_NVIDIA_VISIBLE_DEVICES:-1}
+      CUDA_VISIBLE_DEVICES: ${COSMOS_CUDA_VISIBLE_DEVICES:-1}
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     deploy:
       resources:

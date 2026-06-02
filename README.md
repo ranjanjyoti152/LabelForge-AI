@@ -167,8 +167,11 @@ python tools/prepare_yolo_dataset.py \
   --use-existing \
   --auto-label \
   -o ./datasets/my_project \
+  --save-preview \
   --balance-classes \
   --cosmos-augment \
+  --max-workers \
+  --sam3-batch-size auto \
   --force
 ```
 
@@ -238,6 +241,7 @@ python tools/prepare_yolo_dataset.py \
   --auto-label \
   -o ./datasets/my_project \
   --batch-size 20 \
+  --sam3-batch-size auto \
   --workers 8
 
 # ⚙️ Use CPU-core-based workers
@@ -267,8 +271,12 @@ python tools/prepare_yolo_dataset.py \
   --use-existing \
   --auto-label \
   -o ./datasets/my_project \
+  --save-preview \
   --balance-classes \
-  --cosmos-augment
+  --cosmos-augment \
+  --max-workers \
+  --sam3-batch-size auto \
+  --force
 ```
 
 ### CLI Options
@@ -280,9 +288,10 @@ python tools/prepare_yolo_dataset.py \
 | `--auto-label` | Auto-label with SAM3 | `false` |
 | `--use-existing` | Use Label Studio annotations | `false` |
 | `--batch-size` | Tasks per batch | `10` |
-| `--sam3-batch-size` | Images per SAM3 `/predict` request | `4` |
+| `--sam3-batch-size` | Images per SAM3 `/predict` request; use `auto` or `0` to size from NVIDIA VRAM | `auto` |
 | `--workers` | Parallel download workers; `0` means CPU-core count | `4` |
 | `--max-workers` | Use all CPU cores and match download batch size | `false` |
+| `--preload-tasks` | Fetch all task metadata before processing instead of streaming batches | `false` |
 | `--save-preview` | Save preview images | `false` |
 | `--max-tasks` | Limit tasks (0 = all) | `0` |
 | `--train-split` | Train ratio | `0.8` |
@@ -297,6 +306,8 @@ python tools/prepare_yolo_dataset.py \
 | `--lmstudio-url` | LM Studio API base | `http://localhost:1234/v1` |
 | `--lmstudio-model` | LM Studio model for prompt creation | `.env` |
 | `--cosmos-model` | Cosmos Predict2.5 model | `2B/distilled` |
+
+`--sam3-batch-size auto` queries `nvidia-smi` and chooses a conservative request size from available VRAM. If you hit CUDA OOM or very large HTTP payloads, lower it manually, for example `--sam3-batch-size 16` or `--sam3-batch-size 8`.
 
 ### Output Structure
 
@@ -469,6 +480,7 @@ SAM3_LABELSTUDIO_API_TOKEN=your_token_here
 # ⚡ Batch Processing
 YOLO_BATCH_SIZE=10
 YOLO_WORKERS=4
+YOLO_SAM3_BATCH_SIZE=auto       # auto/0 = choose from NVIDIA VRAM
 ```
 
 <details>
@@ -490,6 +502,9 @@ YOLO_WORKERS=4
 | `SAM3_LABELSTUDIO_FROM_NAME` | LS control tag | `label` |
 | `SAM3_LABELSTUDIO_TO_NAME` | LS object tag | `image` |
 | `SAM3_LABELSTUDIO_MODEL_VERSION` | Model version string | `sam3-v0.1` |
+| `YOLO_BATCH_SIZE` | Tasks fetched/downloaded per batch | `10` |
+| `YOLO_WORKERS` | Parallel download workers; `0`, `auto`, `max`, or `all` means CPU-core count | `4` |
+| `YOLO_SAM3_BATCH_SIZE` | Images per SAM3 `/predict` request; `auto`, `0`, `max`, or `all` sizes from NVIDIA VRAM | `auto` |
 
 </details>
 
